@@ -33,6 +33,7 @@ def _requirer_provide_ingress_requirements(
     port: int,
     relation: Relation,
     host=socket.getfqdn(),
+    ip=socket.gethostbyname(socket.gethostname()),
     mode="http",
     strip_prefix: bool = False,
     redirect_https: bool = False,
@@ -46,7 +47,7 @@ def _requirer_provide_ingress_requirements(
             redirect_https=redirect_https,
             strip_prefix=strip_prefix,
         ).dump()
-        unit_data = IngressRequirerUnitData(host=host).dump()
+        unit_data = IngressRequirerUnitData(host=host, ip=ip).dump()
         # do not emit this event, as we need to 'simultaneously'
         # update the remote unit and app databags
         with harness.hooks_disabled():
@@ -152,6 +153,7 @@ class TestTraefikIngressCharm(unittest.TestCase):
         self.harness: Harness[TraefikIngressCharm] = Harness(TraefikIngressCharm)
         self.harness.set_model_name("test-model")
         self.addCleanup(self.harness.cleanup)
+        self.harness.handle_exec("traefik", ["update-ca-certificates", "--fresh"], result=0)
 
         patcher = patch.object(TraefikIngressCharm, "version", property(lambda *_: "0.0.0"))
         self.mock_version = patcher.start()
@@ -347,6 +349,7 @@ class TestTraefikIngressCharm(unittest.TestCase):
             harness=self.harness,
             relation=relation,
             host="10.0.0.1",
+            ip="10.0.0.1",
             port=3000,
             per_app_relation=True,
         )
@@ -409,6 +412,52 @@ class TestTraefikIngressCharm(unittest.TestCase):
         assert yaml.safe_load(static_config)["entryPoints"][prefix] == expected_entrypoint
 
 
+class TestTraefikCertTransferInterface(unittest.TestCase):
+    def setUp(self):
+        self.harness: Harness[TraefikIngressCharm] = Harness(TraefikIngressCharm)
+        self.harness.set_model_name("test-model")
+        self.addCleanup(self.harness.cleanup)
+        patcher = patch.object(TraefikIngressCharm, "version", property(lambda *_: "0.0.0"))
+        self.mock_version = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.container_name = "traefik"
+
+    @patch("ops.model.Container.exec")
+    @patch("charm._get_loadbalancer_status", lambda **__: "10.0.0.1")
+    @patch("charm.KubernetesServicePatch", lambda *_, **__: None)
+    def test_transferred_ca_certs_are_updated(self, patch_exec):
+        # Given container is ready, when receive-ca-cert relation joins,
+        # then ca certs are updated.
+        provider_app = "self-signed-certificates"
+        self.harness.set_leader(True)
+        self.harness.begin_with_initial_hooks()
+        self.harness.set_can_connect(container=self.container_name, val=True)
+        certificate_transfer_rel_id = self.harness.add_relation(
+            relation_name="receive-ca-cert", remote_app=provider_app
+        )
+        self.harness.add_relation_unit(
+            relation_id=certificate_transfer_rel_id, remote_unit_name=f"{provider_app}/0"
+        )
+        patch_exec.assert_called_once_with(["update-ca-certificates", "--fresh"])
+
+    @patch("ops.model.Container.exec")
+    @patch("charm._get_loadbalancer_status", lambda **__: "10.0.0.1")
+    @patch("charm.KubernetesServicePatch", lambda *_, **__: None)
+    def test_transferred_ca_certs_are_not_updated(self, patch_exec):
+        # Given container is not ready, when receive-ca-cert relation joins,
+        # then not attempting to update ca certs.
+        provider_app = "self-signed-certificates"
+        self.harness.set_leader(True)
+        self.harness.set_can_connect(container=self.container_name, val=False)
+        certificate_transfer_rel_id = self.harness.add_relation(
+            relation_name="receive-ca-cert", remote_app=provider_app
+        )
+        self.harness.add_relation_unit(
+            relation_id=certificate_transfer_rel_id, remote_unit_name=f"{provider_app}/0"
+        )
+        patch_exec.assert_not_called()
+
+
 class TestConfigOptionsValidation(unittest.TestCase):
     @patch("charm._get_loadbalancer_status", lambda **_: "10.0.0.1")
     @patch("charm.KubernetesServicePatch", lambda *_, **__: None)
@@ -416,6 +465,7 @@ class TestConfigOptionsValidation(unittest.TestCase):
         self.harness: Harness[TraefikIngressCharm] = Harness(TraefikIngressCharm)
         self.harness.set_model_name("test-model")
         self.addCleanup(self.harness.cleanup)
+        self.harness.handle_exec("traefik", ["update-ca-certificates", "--fresh"], result=0)
 
         patcher = patch.object(TraefikIngressCharm, "version", property(lambda *_: "0.0.0"))
         self.mock_version = patcher.start()

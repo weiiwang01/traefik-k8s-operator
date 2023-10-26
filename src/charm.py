@@ -5,16 +5,27 @@
 """Charm Traefik."""
 import contextlib
 import enum
+import functools
 import ipaddress
 import json
 import logging
 import re
 import socket
 import typing
+from string import Template
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 import yaml
+from charms.certificate_transfer_interface.v0.certificate_transfer import (
+    CertificateAvailableEvent as CertificateTransferAvailableEvent,
+)
+from charms.certificate_transfer_interface.v0.certificate_transfer import (
+    CertificateRemovedEvent as CertificateTransferRemovedEvent,
+)
+from charms.certificate_transfer_interface.v0.certificate_transfer import (
+    CertificateTransferRequires,
+)
 from charms.grafana_k8s.v0.grafana_dashboard import GrafanaDashboardProvider
 from charms.loki_k8s.v0.loki_push_api import LogProxyConsumer
 from charms.observability_libs.v0.cert_handler import CertHandler
@@ -23,7 +34,7 @@ from charms.observability_libs.v1.kubernetes_service_patch import (
     ServicePort,
 )
 from charms.prometheus_k8s.v0.prometheus_scrape import MetricsEndpointProvider
-from charms.tempo_k8s.v0.charm_instrumentation import trace_charm
+from charms.tempo_k8s.v0.charm_tracing import trace_charm
 from charms.tempo_k8s.v0.tracing import TracingEndpointRequirer
 from charms.tls_certificates_interface.v2.tls_certificates import (
     CertificateInvalidatedEvent,
@@ -69,13 +80,30 @@ _TRAEFIK_CONTAINER_NAME = _TRAEFIK_LAYER_NAME = _TRAEFIK_SERVICE_NAME = "traefik
 # as that is usually safer for Traefik
 _DYNAMIC_CONFIG_DIR = "/opt/traefik/juju"
 _STATIC_CONFIG_DIR = "/etc/traefik"
-_STATIC_CONFIG_PATH = _STATIC_CONFIG_DIR + "/traefik.yaml"
-_DYNAMIC_CERTS_PATH = _DYNAMIC_CONFIG_DIR + "/certificates.yaml"
-_DYNAMIC_TRACING_PATH = _DYNAMIC_CONFIG_DIR + "/tracing.yaml"
-_SERVER_CERT_PATH = _DYNAMIC_CONFIG_DIR + "/server.cert"
-_SERVER_KEY_PATH = _DYNAMIC_CONFIG_DIR + "/server.key"
-_CA_CERT_PATH = _DYNAMIC_CONFIG_DIR + "/ca.cert"
+_STATIC_CONFIG_PATH = f"{_STATIC_CONFIG_DIR}/traefik.yaml"
+_DYNAMIC_CERTS_PATH = f"{_DYNAMIC_CONFIG_DIR}/certificates.yaml"
+_DYNAMIC_TRACING_PATH = f"{_DYNAMIC_CONFIG_DIR}/tracing.yaml"
+_SERVER_CERT_PATH = f"{_DYNAMIC_CONFIG_DIR}/server.cert"
+_SERVER_KEY_PATH = f"{_DYNAMIC_CONFIG_DIR}/server.key"
+_CA_CERTS_PATH = "/usr/local/share/ca-certificates"
+_CA_CERT_PATH = f"{_CA_CERTS_PATH}/traefik-ca.crt"
+_RECV_CA_TEMPLATE = Template(f"{_CA_CERTS_PATH}/receive-ca-cert-$rel_id-ca.crt")
+
 BIN_PATH = "/usr/bin/traefik"
+
+
+def is_hostname(value: Optional[str]) -> bool:
+    """Return False if input value is an IP address; True otherwise."""
+    if value is None:
+        return False
+
+    try:
+        ipaddress.ip_address(value)
+        # No exception raised so this is an IP address.
+        return False
+    except ValueError:
+        # This is not an IP address so assume it's a hostname.
+        return bool(value)
 
 
 class _RoutingMode(enum.Enum):
@@ -118,12 +146,17 @@ class TraefikIngressCharm(CharmBase):
         )
 
         self.container = self.unit.get_container(_TRAEFIK_CONTAINER_NAME)
+        sans = self.server_cert_sans_dns
         self.cert = CertHandler(
             self,
             key="trfk-server-cert",
             peer_relation_name="peers",
-            extra_sans_dns=[self.cert_subject] if self.cert_subject else [],
+            # Route53 complains if CN is not a hostname
+            cert_subject=sans[0] if len(sans) else None,
+            extra_sans_dns=sans,
         )
+
+        self.recv_ca_cert = CertificateTransferRequires(self, "receive-ca-cert")
 
         # FIXME: Do not move these lower. They must exist before `_tcp_ports` is called. The
         # better long-term solution is to allow dynamic modification of the object, and to try
@@ -142,7 +175,7 @@ class TraefikIngressCharm(CharmBase):
 
         self.ingress_per_unit = IngressPerUnitProvider(charm=self)
         self.traefik_route = TraefikRouteProvider(
-            charm=self, external_host=self.external_host  # type: ignore
+            charm=self, external_host=self.external_host, scheme=self._scheme  # type: ignore
         )
 
         web = ServicePort(self._port, name=f"{self.app.name}")
@@ -161,6 +194,7 @@ class TraefikIngressCharm(CharmBase):
                 self.ingress_per_unit.on.data_removed,  # type: ignore
                 self.traefik_route.on.ready,  # type: ignore
                 self.traefik_route.on.data_removed,  # type: ignore
+                self.on.traefik_pebble_ready,  # type: ignore
             ],
         )
 
@@ -192,10 +226,6 @@ class TraefikIngressCharm(CharmBase):
         # TODO update init params once auto-renew is implemented
         # https://github.com/canonical/tls-certificates-interface/issues/24
         observe(
-            self.cert.on.cert_changed,  # type: ignore
-            self._on_cert_changed,
-        )
-        observe(
             self._tracing.on.endpoint_changed,  # type: ignore
             self._on_tracing_endpoint_changed,
         )
@@ -209,6 +239,20 @@ class TraefikIngressCharm(CharmBase):
         observe(self.on.stop, self._on_stop)
         observe(self.on.update_status, self._on_update_status)
         observe(self.on.config_changed, self._on_config_changed)
+        observe(
+            self.cert.on.cert_changed,  # pyright: ignore
+            self._on_cert_changed,
+        )
+        observe(
+            self.recv_ca_cert.on.certificate_available,  # pyright: ignore
+            self._on_recv_ca_cert_available,
+        )
+        observe(
+            # Need to observe a managed relation event because a custom wrapper is not available
+            # https://github.com/canonical/mutual-tls-interface/issues/5
+            self.recv_ca_cert.on.certificate_removed,  # pyright: ignore
+            self._on_recv_ca_cert_removed,
+        )
 
         # observe data_provided and data_removed events for all types of ingress we offer:
         for ingress in (self.ingress_per_unit, self.ingress_per_appv1, self.ingress_per_appv2):
@@ -221,6 +265,42 @@ class TraefikIngressCharm(CharmBase):
 
         # Action handlers
         observe(self.on.show_proxied_endpoints_action, self._on_show_proxied_endpoints)  # type: ignore
+
+    def _on_recv_ca_cert_available(self, event: CertificateTransferAvailableEvent):
+        # Assuming only one cert per relation (this is in line with the original lib design).
+        if not self.container.can_connect():
+            return
+        self._update_received_ca_certs(event)
+
+    def _update_received_ca_certs(self, event: Optional[CertificateTransferAvailableEvent] = None):
+        """Push the cert attached to the event, if it is given; otherwise push all certs.
+
+        This function is needed because relation events are not emitted on upgrade, and because we
+        do not have (nor do we want) persistent storage for certs.
+        Calling this function from upgrade-charm might be too early though. Pebble-ready is
+        preferred.
+        """
+        if event:
+            self.container.push(
+                _RECV_CA_TEMPLATE.substitute(rel_id=event.relation_id), event.ca, make_dirs=True
+            )
+        else:
+            for relation in self.model.relations.get(self.recv_ca_cert.relationship_name, []):
+                # For some reason, relation.units includes our unit and app. Need to exclude them.
+                for unit in set(relation.units).difference([self.app, self.unit]):
+                    # Note: this nested loop handles the case of multi-unit CA, each unit providing
+                    # a different ca cert, but that is not currently supported by the lib itself.
+                    cert_path = _RECV_CA_TEMPLATE.substitute(rel_id=relation.id)
+                    if cert := relation.data[unit].get("ca"):
+                        self.container.push(cert_path, cert, make_dirs=True)
+
+        self._update_system_certs()
+
+    def _on_recv_ca_cert_removed(self, event: CertificateTransferRemovedEvent):
+        # Assuming only one cert per relation (this is in line with the original lib design).
+        target = _RECV_CA_TEMPLATE.substitute(rel_id=event.relation_id)
+        self.container.remove_path(target, recursive=True)
+        self._update_system_certs()
 
     @property
     def charm_tracing_endpoint(self) -> Optional[str]:
@@ -301,6 +381,17 @@ class TraefikIngressCharm(CharmBase):
             self.container.push(_CA_CERT_PATH, cert_handler.ca, make_dirs=True)
         else:
             self.container.remove_path(_CA_CERT_PATH, recursive=True)
+
+        self._update_system_certs()
+
+    def _update_system_certs(self):
+        self.container.exec(["update-ca-certificates", "--fresh"]).wait()
+
+        # Must restart traefik after refreshing certs, otherwise:
+        # - newly added certs will not be loaded and traefik will keep erroring-out with "signed by
+        #   unknown authority".
+        # - old certs will be kept active.
+        self._restart_traefik()
 
     def _on_show_proxied_endpoints(self, event: ActionEvent):
         if not self.ready:
@@ -422,6 +513,16 @@ class TraefikIngressCharm(CharmBase):
                         "keyFile": _SERVER_KEY_PATH,
                     }
                 ],
+                "stores": {
+                    "default": {
+                        # When the external hostname is a bare IP, traefik cannot match a domain,
+                        # so we must set the default cert for the TLS handshake to succeed.
+                        "defaultCertificate": {
+                            "certFile": _SERVER_CERT_PATH,
+                            "keyFile": _SERVER_KEY_PATH,
+                        },
+                    },
+                },
             }
         }
 
@@ -464,6 +565,7 @@ class TraefikIngressCharm(CharmBase):
         self._clear_all_configs_and_restart_traefik()
         # push the (fresh new) configs.
         self._process_status_and_configurations()
+        self._update_received_ca_certs()
         self._set_workload_version()
 
     def _clear_all_configs_and_restart_traefik(self):
@@ -795,6 +897,7 @@ class TraefikIngressCharm(CharmBase):
                 unit_config = self._generate_per_unit_http_config(prefix, data)  # type: ignore
                 if self.unit.is_leader():
                     ipu.publish_url(relation, data["name"], self._get_external_url(prefix))
+
             always_merger.merge(config, unit_config)
 
         # Note: We might be pushing an empty configuration if, for example,
@@ -821,18 +924,28 @@ class TraefikIngressCharm(CharmBase):
         data: Dict[str, Any],
         prefix: str,
     ) -> dict:
-        """Generate a middleware config."""
-        config = {}  # type: Dict[str, Dict[str, Any]]
+        """Generate a middleware config.
+
+        We need to generate a different section per middleware type, otherwise traefik complains:
+          "cannot create middleware: multi-types middleware not supported, consider declaring two
+          different pieces of middleware instead"
+        """
+        no_prefix_middleware = {}  # type: Dict[str, Dict[str, Any]]
         if self._routing_mode is _RoutingMode.path:
             if data.get("strip-prefix", False):
-                config.update({"stripPrefix": {"prefixes": [f"/{prefix}"], "forceSlash": False}})
+                no_prefix_middleware[f"juju-sidecar-noprefix-{prefix}"] = {
+                    "stripPrefix": {"prefixes": [f"/{prefix}"], "forceSlash": False}
+                }
 
-        if data.get("redirect-https", False):
-            config.update({"redirectScheme": {"scheme": "https", "port": 443, "permanent": True}})
+        # Condition rendering the https-redirect middleware on the scheme, otherwise we'd get a 404
+        # when attempting to reach an http endpoint.
+        redir_scheme_middleware = {}
+        if data.get("redirect-https", False) and data.get("scheme") == "https":
+            redir_scheme_middleware[f"juju-sidecar-redir-https-{prefix}"] = {
+                "redirectScheme": {"scheme": "https", "port": 443, "permanent": True}
+            }
 
-        if config:
-            return {f"juju-sidecar-noprefix-{prefix}": config}
-        return {}
+        return {**no_prefix_middleware, **redir_scheme_middleware}
 
     def _generate_per_unit_tcp_config(self, prefix: str, data: RequirerData_IPU) -> dict:
         """Generate a config dict for a given unit for IngressPerUnit in tcp mode."""
@@ -858,7 +971,7 @@ class TraefikIngressCharm(CharmBase):
                         "loadBalancer": {
                             "servers": [{"address": f"{data['host']}:{data['port']}"}]
                         }
-                    }
+                    },
                 },
             }
         }
@@ -866,7 +979,7 @@ class TraefikIngressCharm(CharmBase):
 
     def _generate_per_unit_http_config(self, prefix: str, data: RequirerData_IPU) -> dict:
         """Generate a config dict for a given unit for IngressPerUnit."""
-        lb_servers = [{"url": f"http://{data['host']}:{data['port']}"}]
+        lb_servers = [{"url": f"{data.get('scheme', 'http')}://{data['host']}:{data['port']}"}]
         return self._generate_config_block(prefix, lb_servers, data)  # type: ignore
 
     def _generate_config_block(
@@ -925,21 +1038,21 @@ class TraefikIngressCharm(CharmBase):
             # i.e. traefik itself is not related to tls certificates, but the ingress requirer is
             transport_name = "reverseTerminationTransport"
             lb_def["serversTransport"] = transport_name
-            transports = {transport_name: {"insecureSkipVerify": True}}
+            transports = {transport_name: {"insecureSkipVerify": False}}
 
         elif is_termination:
             # i.e. traefik itself is related to tls certificates, but the ingress requirer is not
             transports = {}
 
         elif is_end_to_end:
+            # We cannot assume traefik's CA is the same CA that signed the proxied apps.
+            # Since we use the update_ca_certificates machinery, we don't need to specify the
+            # "rootCAs" entry.
+            # Keeping the serverTransports section anyway because it is informative ("endToEndTLS"
+            # vs "reverseTerminationTransport") when inspecting the config file in production.
             transport_name = "endToEndTLS"
             lb_def["serversTransport"] = transport_name
-            transports = {
-                transport_name: {
-                    # Note: assuming traefik's CA is the same CA that signed the proxied apps.
-                    "rootCAs": [_CA_CERT_PATH],
-                }
-            }
+            transports = {transport_name: {"insecureSkipVerify": False}}
 
         else:
             transports = {}
@@ -972,19 +1085,25 @@ class TraefikIngressCharm(CharmBase):
         service_name: str,
     ) -> Dict[str, Any]:
         """Generate a TLS configuration segment."""
+        tls_entry = (
+            {
+                "domains": [
+                    {
+                        "main": self.external_host,
+                        "sans": [f"*.{self.external_host}"],
+                    },
+                ],
+            }
+            if is_hostname(self.external_host)
+            else {}  # When the external host is a bare IP, we do not need the 'domains' entry.
+        )
+
         return {
             f"{router_name}-tls": {
                 "rule": route_rule,
                 "service": service_name,
                 "entryPoints": ["websecure"],
-                "tls": {
-                    "domains": [
-                        {
-                            "main": self.external_host,
-                            "sans": [f"*.{self.external_host}"],
-                        },
-                    ],
-                },
+                "tls": tls_entry,
             }
         }
 
@@ -1010,12 +1129,15 @@ class TraefikIngressCharm(CharmBase):
         lb_servers = [{"url": f"http://{data['host']}:{data['port']}"}]
         return self._generate_config_block(prefix, lb_servers, data)  # type: ignore
 
+    @property
+    def _scheme(self):
+        return "https" if self.cert.enabled else "http"
+
     def _get_external_url(self, prefix):
-        scheme = "https" if self.cert.enabled else "http"
         if self._routing_mode is _RoutingMode.path:
-            url = f"{scheme}://{self.external_host}/{prefix}"
+            url = f"{self._scheme}://{self.external_host}/{prefix}"
         else:  # _RoutingMode.subdomain
-            url = f"{scheme}://{prefix}.{self.external_host}/"
+            url = f"{self._scheme}://{prefix}.{self.external_host}/"
         return url
 
     def _wipe_ingress_for_all_relations(self):
@@ -1164,34 +1286,23 @@ class TraefikIngressCharm(CharmBase):
             )
 
     @property
-    def cert_subject(self) -> Optional[str]:
-        """Provide certificate subject."""
-        host_or_ip = self.external_host
+    def server_cert_sans_dns(self) -> List[str]:
+        """Provide certificate SANs DNS."""
+        target = self.external_host
 
-        def is_hostname(st: Optional[str]) -> bool:
-            if st is None:
-                return False
-
-            try:
-                ipaddress.ip_address(st)
-                # No exception raised so this is an IP address.
-                return False
-            except ValueError:
-                # This is not an IP address so assume it's a hostname.
-                return st is not None
-
-        if is_hostname(host_or_ip):
-            return host_or_ip
+        if is_hostname(target):
+            assert isinstance(target, str)  # for type checker
+            return [target]
 
         # This is an IP address. Try to look up the hostname.
-        try:
-            lookup = socket.gethostbyaddr(host_or_ip)[0]  # type: ignore
-            return lookup if is_hostname(lookup) else None
-        except (OSError, TypeError):
-            # We do not want to return `socket.getfqdn()` because the user's browser would
-            # immediately complain about an invalid cert. If we can't resolve it via any method,
-            # return None
-            return None
+        with contextlib.suppress(OSError, TypeError):
+            name, _, _ = socket.gethostbyaddr(target)  # type: ignore
+            # Do not return "hostname" like '10-43-8-149.kubernetes.default.svc.cluster.local'
+            if is_hostname(name) and not name.endswith(".svc.cluster.local"):
+                return [name]
+
+        # If all else fails, we'd rather use the bare IP
+        return [target] if target else []
 
     @property
     def _hostname(self) -> str:
@@ -1206,6 +1317,7 @@ class TraefikIngressCharm(CharmBase):
         ]
 
 
+@functools.lru_cache
 def _get_loadbalancer_status(namespace: str, service_name: str):
     client = Client()  # type: ignore
     traefik_service = client.get(Service, name=service_name, namespace=namespace)
